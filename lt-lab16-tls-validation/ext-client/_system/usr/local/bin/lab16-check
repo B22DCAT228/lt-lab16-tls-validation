@@ -1,0 +1,130 @@
+#!/usr/bin/python3
+import sys
+import ssl
+import socket
+import hashlib
+from pathlib import Path
+
+IP = "172.31.66.40"
+PORT = 8443
+HOST = "tls.lab.local"
+CA = "/etc/lab16/ca.crt"
+CERT = "/etc/lab16/server.crt"
+
+OUT = Path.home() / "lab16" / "results.log"
+
+def record(message):
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    with OUT.open("a") as f:
+        f.write(message + "\n")
+    print(message)
+
+def connect(hostname=HOST, trusted=True):
+    ctx = ssl.create_default_context(
+        cafile=CA if trusted else None
+    )
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    raw = socket.create_connection((IP, PORT), timeout=5)
+    try:
+        return ctx.wrap_socket(raw, server_hostname=hostname)
+    except Exception:
+        raw.close()
+        raise
+
+def check(mode):
+    if mode == "untrusted":
+        try:
+            with connect(trusted=False):
+                pass
+        except ssl.SSLCertVerificationError as e:
+            msg = str(e).lower()
+            if ("issuer" in msg or "self-signed" in msg
+                    or "certificate verify failed" in msg
+                    and getattr(e, "verify_code", 0) in (18, 19, 20, 21)):
+                record("LAB16_UNTRUSTED_CA_REJECTED")
+                return
+            raise
+        raise RuntimeError("Untrusted certificate was accepted")
+
+    elif mode == "hostname":
+        try:
+            with connect(hostname="wrong.lab.local"):
+                pass
+        except ssl.SSLCertVerificationError as e:
+            msg = str(e).lower()
+            if ("hostname mismatch" in msg
+                    or "not valid for" in msg
+                    or getattr(e, "verify_code", 0) == 62):
+                record("LAB16_HOSTNAME_MISMATCH_REJECTED")
+                return
+            raise
+        raise RuntimeError("Wrong hostname was accepted")
+
+    elif mode == "trusted":
+        with connect() as s:
+            assert s.getpeercert()
+        record("LAB16_TRUSTED_CA_PASS")
+
+    elif mode == "san":
+        with connect() as s:
+            cert = s.getpeercert()
+            names = cert.get("subjectAltName", ())
+            assert ("DNS", HOST) in names
+        record("LAB16_SAN_PASS")
+
+    elif mode == "fingerprint":
+        with connect() as s:
+            actual = hashlib.sha256(
+                s.getpeercert(binary_form=True)
+            ).hexdigest()
+
+        pem = Path(CERT).read_text()
+        expected = hashlib.sha256(
+            ssl.PEM_cert_to_DER_cert(pem)
+        ).hexdigest()
+
+        assert actual == expected
+        record("LAB16_FINGERPRINT_PASS sha256=" + actual)
+
+    elif mode == "tls":
+        with connect() as s:
+            version = s.version()
+            assert version in ("TLSv1.2", "TLSv1.3")
+        record("LAB16_TLS_VERSION_PASS version=" + version)
+
+    elif mode == "http":
+        with connect() as s:
+            request = (
+                "GET / HTTP/1.1\r\n"
+                "Host: tls.lab.local\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            s.sendall(request.encode("ascii"))
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+
+        assert b" 200 " in data.split(b"\r\n", 1)[0]
+        assert b"LAB16_HTTPS_OK" in data
+        record("LAB16_HTTPS_RESPONSE_PASS")
+
+    else:
+        raise ValueError("Unknown check: " + mode)
+
+if __name__ == "__main__":
+    modes = (
+        "untrusted", "hostname", "trusted", "san",
+        "fingerprint", "tls", "http"
+    )
+    if len(sys.argv) != 2 or sys.argv[1] not in modes:
+        print("Usage: lab16-check " + "|".join(modes))
+        sys.exit(2)
+
+    try:
+        check(sys.argv[1])
+    except Exception as e:
+        print("LAB16_CHECK_FAIL:", str(e))
+        sys.exit(1)
